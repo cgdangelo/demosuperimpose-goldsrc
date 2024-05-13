@@ -368,7 +368,7 @@ pub enum TempEntityEntity<'a> {
     // [u8; 19]
     TeSpriteTrail(&'a [u8]) = 15,
     // [u8; 10]
-    TeSprite(&'a [u8]) = 16,
+    TeSprite(&'a [u8]) = 17,
     // [u8; 16]
     TeBeamSprite(&'a [u8]) = 18,
     // [u8; 24]
@@ -629,7 +629,7 @@ pub struct TeSpriteTrail<'a> {
     pub velocity_randomness: u8,
 }
 
-// TE_SPRITE 16
+// TE_SPRITE 17
 #[derive(Clone, Debug)]
 pub struct TeSprite<'a> {
     // [i16; 3]

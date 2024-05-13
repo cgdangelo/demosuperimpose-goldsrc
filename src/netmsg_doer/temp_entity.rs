@@ -85,7 +85,7 @@ impl<'a> NetMsgDoer<'a, SvcTempEntity<'a>> for TempEntity {
             }
             14 => map(take(9usize), |res| TempEntityEntity::TeImplosion(res))(i)?,
             15 => map(take(19usize), |res| TempEntityEntity::TeSpriteTrail(res))(i)?,
-            16 => map(take(10usize), |res| TempEntityEntity::TeSprite(res))(i)?,
+            17 => map(take(10usize), |res| TempEntityEntity::TeSprite(res))(i)?,
             18 => map(take(16usize), |res| TempEntityEntity::TeBeamSprite(res))(i)?,
             19 => map(take(24usize), |res| TempEntityEntity::TeBeamTorus(res))(i)?,
             20 => map(take(24usize), |res| TempEntityEntity::TeBeamDisk(res))(i)?,
