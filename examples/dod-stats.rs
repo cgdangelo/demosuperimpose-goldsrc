@@ -8,15 +8,94 @@ use std::fs::File;
 use std::io::Read;
 use std::str::from_utf8;
 
+use nom::number::complete::{be_u16, le_u8};
+use nom::sequence::tuple;
+use nom::{IResult, Parser};
+
 use demosuperimpose_goldsrc::netmsg_doer::parse_netmsg;
 use demosuperimpose_goldsrc::netmsg_doer::utils::get_initial_delta;
 use demosuperimpose_goldsrc::open_demo;
 use demosuperimpose_goldsrc::types::EngineMessage::SvcUpdateUserInfo;
-use demosuperimpose_goldsrc::types::Message::EngineMessage;
 use demosuperimpose_goldsrc::types::Message::UserMessage;
-use demosuperimpose_goldsrc::types::SvcNewUserMsg;
+use demosuperimpose_goldsrc::types::{Message, SvcNewUserMsg};
 
 struct ScoreboardEntry(String, String, (u8, u8, u8));
+
+#[derive(Debug)]
+struct DeathMsg {
+    killer_idx: u8,
+    victim_idx: u8,
+    weapon_idx: u8,
+}
+
+#[derive(Debug)]
+struct Frags {
+    player_idx: u8,
+    value: u8,
+}
+
+#[derive(Debug)]
+struct ScoreShort {
+    player_idx: u8,
+    points: u8,
+    kills: u16,
+    deaths: u16,
+}
+
+#[derive(Debug)]
+struct ScoreInfo {
+    player_idx: u8,
+    points: u8,
+    kills: u8,
+    deaths: u8,
+    class: u8,
+    team: u8,
+}
+
+#[derive(Debug)]
+enum Team {
+    ALLIES,
+    AXIS,
+    SPECTATOR,
+    DISCONNECTED,
+}
+
+fn parse_score_info(i: &[u8]) -> IResult<&[u8], ScoreInfo> {
+    let (i, (player_idx, points, kills, deaths, class, team)) =
+        tuple((le_u8, le_u8, le_u8, le_u8, le_u8, le_u8))(i)?;
+
+    Ok((
+        i,
+        ScoreInfo {
+            player_idx,
+            points,
+            kills,
+            deaths,
+            class,
+            team,
+        },
+    ))
+}
+
+fn parse_frags(i: &[u8]) -> IResult<&[u8], Frags> {
+    let (i, (player_idx, value)) = tuple((le_u8, le_u8))(i)?;
+
+    Ok((i, Frags { player_idx, value }))
+}
+
+fn parse_score_short(i: &[u8]) -> IResult<&[u8], ScoreShort> {
+    let (i, (player_idx, points, kills, deaths)) = tuple((le_u8, le_u8, be_u16, be_u16))(i)?;
+
+    Ok((
+        i,
+        ScoreShort {
+            player_idx,
+            points,
+            kills,
+            deaths,
+        },
+    ))
+}
 
 fn main() {
     let args: Vec<String> = args().collect();
@@ -56,47 +135,114 @@ fn main() {
     network_messages.for_each(|message| match message {
         UserMessage(user_message) => {
             match from_utf8(user_message.name).map(|s| s.trim_matches('\0')) {
-                Ok("DeathMsg") => {
-                    if let [killer_client_index, victim_client_index, ..] = user_message.data {
-                        if *killer_client_index == 0 || *victim_client_index == 0 {
-                            return;
+                Ok(msg_name) => {
+                    match msg_name {
+                        "Frags" => {
+                            println!("{} {:?}", msg_name, user_message.data);
+
+                            if let Ok((_, frags)) = parse_frags(user_message.data) {
+                                println!("{:?}", frags);
+
+                                scoreboard
+                                    .entry(frags.player_idx - 1)
+                                    .and_modify(|(kills, _, _)| {
+                                        *kills = frags.value;
+                                    })
+                                    .or_insert((frags.value, 0, 0));
+                            }
                         }
 
-                        let killer_idx = killer_client_index - 1;
-                        let victim_idx = victim_client_index - 1;
+                        "ScoreInfo" => {
+                            println!("{} {:?}", msg_name, user_message.data);
 
-                        scoreboard.entry(killer_idx).or_insert((0, 0, 0));
-                        scoreboard.entry(victim_idx).or_insert((0, 0, 0));
+                            if let Ok((_, score_info)) = parse_score_info(user_message.data) {
+                                println!("{:?}", score_info);
 
-                        if killer_idx != victim_idx {
-                            scoreboard
-                                .entry(killer_idx)
-                                .and_modify(|(kills, _, teamkills)| {
-                                    let killer_team = player_teams.get(&killer_idx);
-                                    let player_team = player_teams.get(&victim_idx);
-
-                                    let is_teamkill = match (killer_team, player_team) {
-                                        (Some(a), Some(b)) => a == b,
-                                        _ => false,
-                                    };
-
-                                    if !is_teamkill {
-                                        *kills += 1;
-                                    } else {
-                                        *teamkills += 1;
-                                    }
-                                });
+                                scoreboard.insert(
+                                    score_info.player_idx - 1,
+                                    (score_info.kills, score_info.deaths, 0),
+                                );
+                            }
                         }
 
-                        scoreboard.entry(victim_idx).and_modify(|(_, deaths, _)| {
-                            *deaths += 1;
-                        });
+                        "ScoreShort" => {
+                            println!("{} {:?}", msg_name, user_message.data);
+
+                            if let Ok((_, score_short)) = parse_score_short(user_message.data) {
+                                println!("{:?}", score_short);
+
+                                scoreboard.insert(
+                                    score_short.player_idx - 1,
+                                    (score_short.kills as u8, score_short.deaths as u8, 0),
+                                );
+                            }
+                        }
+
+                        "DeathMsg" | "RoundState" => {
+                            println!("{:10} {:?}", msg_name, user_message.data)
+                        }
+                        _ => {} // "AmmoX" | "BloodPuff" | "ClCorpse" | "CurWeapon" | "Health"
+                                // | "HideWeapon" | "InitHUD" | "MOTD" | "PClass" | "ReloadDone"
+                                // | "ResetHUD" | "ResetSens" | "Scope" | "ScreenFade" | "ScreenShake"
+                                // | "ServerName" | "SetFOV" | "Spectator" | "TextMsg" | "VGUIMenu"
+                                // | "VoiceMask" | "WaveStatus" | "WaveTime" | "WeaponList" => {}
+                                // msg_name => {
+                                //     println!("{:10} {:?}", msg_name, user_message.data)
+                                // }
                     }
+                    // ScoreInfo
+                    // - 1 player_idx
+                    // - 2 unk
+                    // - 3 unk
+                    // - 4 unk
+                    // - 5 unk
+                    // - 6 unk
+                    // - 7 team_id
                 }
+
+                // Ok("DeathMsg") => {
+                //     println!("{} {:?}", "DeathMsg", user_message.data);
+                //
+                //     if let [killer_client_index, victim_client_index, ..] = user_message.data {
+                //         if *killer_client_index == 0 || *victim_client_index == 0 {
+                //             return;
+                //         }
+                //
+                //         let killer_idx = killer_client_index - 1;
+                //         let victim_idx = victim_client_index - 1;
+                //
+                //         scoreboard.entry(killer_idx).or_insert((0, 0, 0));
+                //         scoreboard.entry(victim_idx).or_insert((0, 0, 0));
+                //
+                //         if killer_idx != victim_idx {
+                //             scoreboard
+                //                 .entry(killer_idx)
+                //                 .and_modify(|(kills, _, teamkills)| {
+                //                     let killer_team = player_teams.get(&killer_idx);
+                //                     let player_team = player_teams.get(&victim_idx);
+                //
+                //                     let is_teamkill = match (killer_team, player_team) {
+                //                         (Some(a), Some(b)) => a == b,
+                //                         _ => false,
+                //                     };
+                //
+                //                     if !is_teamkill {
+                //                         *kills += 1;
+                //                     } else {
+                //                         *teamkills += 1;
+                //                     }
+                //                 });
+                //         }
+                //
+                //         scoreboard.entry(victim_idx).and_modify(|(_, deaths, _)| {
+                //             *deaths += 1;
+                //         });
+                //     }
+                // }
                 _ => {}
             }
         }
-        EngineMessage(engine_message) => match engine_message {
+        Message::EngineMessage(engine_message) => match engine_message {
             SvcUpdateUserInfo(msg) => {
                 let info = from_utf8(msg.user_info)
                     .map(|s| s.trim_matches(['\0', '\\']))
