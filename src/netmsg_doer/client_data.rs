@@ -6,6 +6,18 @@ use super::{
 pub struct ClientData {}
 impl<'a> NetMsgDoerWithDelta<'a, SvcClientData> for ClientData {
     fn parse(i: &'a [u8], delta_decoders: &DeltaDecoderTable) -> IResult<&'a [u8], SvcClientData> {
+        let is_hltv: bool = unsafe { IS_HLTV };
+
+        /// SVC_CLIENTDATA has no message contents on HLTV demos.
+        if is_hltv {
+            return Ok((i, SvcClientData {
+                has_delta_update_mask: false,
+                delta_update_mask: None,
+                client_data: Default::default(),
+                weapon_data: None,
+            }));
+        }
+
         let mut br = BitReader::new(i);
 
         let has_delta_update_mask = br.read_1_bit();
@@ -53,9 +65,17 @@ impl<'a> NetMsgDoerWithDelta<'a, SvcClientData> for ClientData {
 
     fn write(i: SvcClientData, delta_decoders: &DeltaDecoderTable) -> Vec<u8> {
         let mut writer = ByteWriter::new();
-        let mut bw = BitWriter::new();
 
         writer.append_u8(EngineMessageType::SvcClientData as u8);
+
+        let is_hltv: bool = unsafe { IS_HLTV };
+
+        /// SVC_CLIENTDATA has no message contents on HLTV demos.
+        if is_hltv {
+            return writer.data;
+        }
+
+        let mut bw = BitWriter::new();
 
         bw.append_bit(i.has_delta_update_mask);
 

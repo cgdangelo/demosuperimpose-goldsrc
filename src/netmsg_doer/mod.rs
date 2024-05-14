@@ -167,6 +167,9 @@ macro_rules! wrap_parse {
 // If there is any design change then Message type is wrapped again in another type that can carry extra info.
 static mut MAX_CLIENT: u8 = 0;
 
+/// True if HLTV client demo, false otherwise.
+static mut IS_HLTV: bool = false;
+
 fn parse_single_netmsg<'a>(
     i: &'a [u8],
     delta_decoders: &mut DeltaDecoderTable,
@@ -361,7 +364,15 @@ fn parse_single_netmsg<'a>(
                 EngineMessageType::SvcFileTxferFailed => {
                     wrap_parse!(i, FileTxferFailed, SvcFileTxferFailed)
                 }
-                EngineMessageType::SvcHltv => wrap_parse!(i, Hltv, SvcHltv),
+                EngineMessageType::SvcHltv => {
+                    let res = wrap_parse!(i, Hltv, SvcHltv);
+                    if let Message::EngineMessage(EngineMessage::SvcHltv(_)) = &res.1 {
+                        unsafe {
+                            IS_HLTV = true;
+                        }
+                    }
+                    res
+                },
                 EngineMessageType::SvcDirector => {
                     wrap_parse!(i, Director, SvcDirector)
                 }
