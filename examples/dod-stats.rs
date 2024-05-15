@@ -8,25 +8,14 @@ use std::fs::File;
 use std::io::Read;
 use std::str::from_utf8;
 
+use nom::IResult;
 use nom::number::complete::{be_u16, le_u8};
 use nom::sequence::tuple;
-use nom::{IResult, Parser};
 
 use demosuperimpose_goldsrc::netmsg_doer::parse_netmsg;
 use demosuperimpose_goldsrc::netmsg_doer::utils::get_initial_delta;
 use demosuperimpose_goldsrc::open_demo;
-use demosuperimpose_goldsrc::types::EngineMessage::SvcUpdateUserInfo;
-use demosuperimpose_goldsrc::types::Message::UserMessage;
-use demosuperimpose_goldsrc::types::{Message, SvcNewUserMsg};
-
-struct ScoreboardEntry(String, String, (u8, u8, u8));
-
-#[derive(Debug)]
-struct DeathMsg {
-    killer_idx: u8,
-    victim_idx: u8,
-    weapon_idx: u8,
-}
+use demosuperimpose_goldsrc::types::{EngineMessage, Message, SvcNewUserMsg, SvcUpdateUserInfo};
 
 #[derive(Debug)]
 struct Frags {
@@ -52,12 +41,63 @@ struct ScoreInfo {
     team: u8,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum Team {
     ALLIES,
     AXIS,
-    SPECTATOR,
-    DISCONNECTED,
+    SPECTATORS,
+    UNKNOWN,
+}
+
+impl From<u8> for Team {
+    fn from(value: u8) -> Self {
+        match value {
+            1 => Team::ALLIES,
+            2 => Team::AXIS,
+            3 => Team::SPECTATORS,
+            _ => Team::UNKNOWN,
+        }
+    }
+}
+
+impl From<&str> for Team {
+    fn from(value: &str) -> Self {
+        match value {
+            "allies" => Team::ALLIES,
+            "axis" => Team::AXIS,
+            "spectators" => Team::SPECTATORS,
+            _ => Team::UNKNOWN,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ScoreboardEntry {
+    name: String,
+    team: Team,
+    points: u8,
+    kills: u8,
+    deaths: u8,
+}
+
+fn get_update_user_info_fields<'a>(
+    update_user_info: &'a SvcUpdateUserInfo,
+) -> Option<HashMap<&'a str, &'a str>> {
+    let mut info_fields: HashMap<&str, &str> = HashMap::new();
+
+    from_utf8(update_user_info.user_info)
+        .map(|s| s.trim_matches(['\0', '\\']))
+        .map(|s| s.split("\\").collect::<Vec<&str>>())
+        .ok()?
+        .chunks_exact(2)
+        .for_each(|chunk| match chunk {
+            [k, v] => {
+                info_fields.insert(k, v);
+            }
+            _ => {}
+        });
+
+    Some(info_fields)
 }
 
 fn parse_score_info(i: &[u8]) -> IResult<&[u8], ScoreInfo> {
@@ -128,193 +168,148 @@ fn main() {
         })
         .flat_map(identity);
 
-    let mut player_names: HashMap<u8, &str> = HashMap::new();
-    let mut player_teams: HashMap<u8, &str> = HashMap::new();
-    let mut scoreboard: HashMap<u8, (u8, u8, u8)> = HashMap::new();
+    // Mapping of player index to player id.
+    let mut player_id_cache: HashMap<u8, u32> = HashMap::new();
+
+    // Mapping of player id to aggregated metrics.
+    let mut scoreboard: HashMap<u32, ScoreboardEntry> = HashMap::new();
 
     network_messages.for_each(|message| match message {
-        UserMessage(user_message) => {
-            match from_utf8(user_message.name).map(|s| s.trim_matches('\0')) {
-                Ok(msg_name) => {
-                    match msg_name {
-                        "Frags" => {
-                            println!("{} {:?}", msg_name, user_message.data);
+        Message::EngineMessage(EngineMessage::SvcUpdateUserInfo(update_user_info)) => {
+            let fields = get_update_user_info_fields(&update_user_info).unwrap_or(HashMap::new());
 
-                            if let Ok((_, frags)) = parse_frags(user_message.data) {
-                                println!("{:?}", frags);
+            player_id_cache.insert(update_user_info.index, update_user_info.id);
 
-                                scoreboard
-                                    .entry(frags.player_idx - 1)
-                                    .and_modify(|(kills, _, _)| {
-                                        *kills = frags.value;
-                                    })
-                                    .or_insert((frags.value, 0, 0));
-                            }
+            let name = &fields
+                .get("name")
+                .map(|value| value.to_string())
+                .unwrap_or(format!("Player {}", update_user_info.id));
+
+            let team = &fields
+                .get("team")
+                .map(|value| Team::from(*value))
+                .unwrap_or(Team::UNKNOWN);
+
+            scoreboard
+                .entry(update_user_info.id)
+                .and_modify(|entry| {
+                    entry.name = name.to_owned();
+                    entry.team = team.to_owned();
+                })
+                .or_insert(ScoreboardEntry {
+                    name: name.to_owned(),
+                    team: team.to_owned(),
+                    points: 0,
+                    kills: 0,
+                    deaths: 0,
+                });
+        }
+        Message::UserMessage(user_msg) => {
+            match from_utf8(user_msg.name).map(|s| s.trim_matches('\0')) {
+                Ok("Frags") => {
+                    if let Ok((_, frags)) = parse_frags(user_msg.data) {
+                        let player_idx = frags.player_idx - 1;
+
+                        if let Some(player_id) = player_id_cache.get(&player_idx) {
+                            scoreboard
+                                .entry(*player_id)
+                                .and_modify(|entry| {
+                                    entry.kills = frags.value;
+                                })
+                                .or_insert(ScoreboardEntry {
+                                    name: format!("Player {}", player_id),
+                                    points: 0,
+                                    deaths: 0,
+                                    kills: frags.value,
+                                    team: Team::UNKNOWN,
+                                });
                         }
-
-                        "ScoreInfo" => {
-                            println!("{} {:?}", msg_name, user_message.data);
-
-                            if let Ok((_, score_info)) = parse_score_info(user_message.data) {
-                                println!("{:?}", score_info);
-
-                                scoreboard.insert(
-                                    score_info.player_idx - 1,
-                                    (score_info.kills, score_info.deaths, 0),
-                                );
-                            }
-                        }
-
-                        "ScoreShort" => {
-                            println!("{} {:?}", msg_name, user_message.data);
-
-                            if let Ok((_, score_short)) = parse_score_short(user_message.data) {
-                                println!("{:?}", score_short);
-
-                                scoreboard.insert(
-                                    score_short.player_idx - 1,
-                                    (score_short.kills as u8, score_short.deaths as u8, 0),
-                                );
-                            }
-                        }
-
-                        "DeathMsg" | "RoundState" => {
-                            println!("{:10} {:?}", msg_name, user_message.data)
-                        }
-                        _ => {} // "AmmoX" | "BloodPuff" | "ClCorpse" | "CurWeapon" | "Health"
-                                // | "HideWeapon" | "InitHUD" | "MOTD" | "PClass" | "ReloadDone"
-                                // | "ResetHUD" | "ResetSens" | "Scope" | "ScreenFade" | "ScreenShake"
-                                // | "ServerName" | "SetFOV" | "Spectator" | "TextMsg" | "VGUIMenu"
-                                // | "VoiceMask" | "WaveStatus" | "WaveTime" | "WeaponList" => {}
-                                // msg_name => {
-                                //     println!("{:10} {:?}", msg_name, user_message.data)
-                                // }
                     }
-                    // ScoreInfo
-                    // - 1 player_idx
-                    // - 2 unk
-                    // - 3 unk
-                    // - 4 unk
-                    // - 5 unk
-                    // - 6 unk
-                    // - 7 team_id
                 }
 
-                // Ok("DeathMsg") => {
-                //     println!("{} {:?}", "DeathMsg", user_message.data);
-                //
-                //     if let [killer_client_index, victim_client_index, ..] = user_message.data {
-                //         if *killer_client_index == 0 || *victim_client_index == 0 {
-                //             return;
-                //         }
-                //
-                //         let killer_idx = killer_client_index - 1;
-                //         let victim_idx = victim_client_index - 1;
-                //
-                //         scoreboard.entry(killer_idx).or_insert((0, 0, 0));
-                //         scoreboard.entry(victim_idx).or_insert((0, 0, 0));
-                //
-                //         if killer_idx != victim_idx {
-                //             scoreboard
-                //                 .entry(killer_idx)
-                //                 .and_modify(|(kills, _, teamkills)| {
-                //                     let killer_team = player_teams.get(&killer_idx);
-                //                     let player_team = player_teams.get(&victim_idx);
-                //
-                //                     let is_teamkill = match (killer_team, player_team) {
-                //                         (Some(a), Some(b)) => a == b,
-                //                         _ => false,
-                //                     };
-                //
-                //                     if !is_teamkill {
-                //                         *kills += 1;
-                //                     } else {
-                //                         *teamkills += 1;
-                //                     }
-                //                 });
-                //         }
-                //
-                //         scoreboard.entry(victim_idx).and_modify(|(_, deaths, _)| {
-                //             *deaths += 1;
-                //         });
-                //     }
-                // }
+                Ok("ScoreInfo") => {
+                    if let Ok((_, score_info)) = parse_score_info(user_msg.data) {
+                        let player_idx = score_info.player_idx - 1;
+
+                        if let Some(player_id) = player_id_cache.get(&player_idx) {
+                            scoreboard.entry(*player_id).and_modify(|entry| {
+                                entry.team = Team::from(score_info.team);
+                                entry.points = score_info.points;
+                                entry.kills = score_info.kills;
+                                entry.deaths = score_info.deaths;
+                            });
+                        }
+                    }
+                }
+
+                Ok("ScoreShort") => {
+                    if let Ok((_, score_short)) = parse_score_short(user_msg.data) {
+                        let player_idx = score_short.player_idx - 1;
+
+                        if let Some(player_id) = player_id_cache.get(&player_idx) {
+                            scoreboard
+                                .entry(*player_id)
+                                .and_modify(|entry| {
+                                    entry.points = score_short.points;
+                                    entry.kills = score_short.kills as u8;
+                                    entry.deaths = score_short.deaths as u8;
+                                })
+                                .or_insert(ScoreboardEntry {
+                                    name: format!("Player {}", player_id),
+                                    points: score_short.points,
+                                    kills: score_short.kills as u8,
+                                    deaths: score_short.deaths as u8,
+                                    team: Team::UNKNOWN,
+                                });
+                        }
+                    }
+                }
                 _ => {}
             }
         }
-        Message::EngineMessage(engine_message) => match engine_message {
-            SvcUpdateUserInfo(msg) => {
-                let info = from_utf8(msg.user_info)
-                    .map(|s| s.trim_matches(['\0', '\\']))
-                    .map(|s| s.split("\\").collect::<Vec<&str>>())
-                    .unwrap();
-
-                info.iter()
-                    .enumerate()
-                    .step_by(2)
-                    .for_each(|(i, v)| match *v {
-                        "name" => {
-                            if let Some(name) = info.get(i + 1) {
-                                player_names.insert(msg.index, name);
-                            }
-                        }
-                        "team" => {
-                            if let Some(team) = info.get(i + 1) {
-                                player_teams.insert(msg.index, team);
-                            }
-                        }
-                        _ => {}
-                    })
-            }
-            _ => {}
-        },
+        _ => {}
     });
 
-    let mut scoreboard_entries: Vec<ScoreboardEntry> = scoreboard
-        .iter()
-        .filter_map(|(player_idx, scores)| {
-            if *player_idx == 0 {
-                return None;
-            }
-
-            let mapped_name = match player_names.get(player_idx) {
-                Some(player_name) => player_name.to_string(),
-                None => format!("Player {}", player_idx),
-            };
-
-            let mapped_team = match player_teams.get(player_idx) {
-                Some(team) => format!(
-                    "{}",
-                    match *team {
-                        "allies" => "Allies",
-                        "axis" => "Axis",
-                        _ => "Spectator",
-                    }
-                ),
-                None => "Unknown".to_string(),
-            };
-
-            Some(ScoreboardEntry(mapped_name, mapped_team, scores.to_owned()))
-        })
-        .collect();
+    let mut scoreboard_entries = scoreboard
+        .into_iter()
+        .collect::<Vec<(u32, ScoreboardEntry)>>();
 
     scoreboard_entries.sort_by(
-        |ScoreboardEntry(_, a_team, (a_kills, _, _)),
-         ScoreboardEntry(_, b_team, (b_kills, _, _))| {
-            match (a_team.as_str(), b_team.as_str()) {
-                ("Axis", "Allies") => Ordering::Greater,
-                ("Allies", "Axis") => Ordering::Less,
-                _ => a_kills.cmp(b_kills).reverse(),
-            }
+        |(_, first), (_, second)| match (&first.team, &second.team) {
+            (Team::ALLIES, Team::AXIS) => Ordering::Less,
+            (Team::AXIS, Team::ALLIES) => Ordering::Greater,
+            (Team::ALLIES | Team::AXIS, Team::SPECTATORS) => Ordering::Less,
+            (Team::SPECTATORS, Team::ALLIES | Team::AXIS) => Ordering::Greater,
+            _ => first
+                .points
+                .cmp(&second.points)
+                .reverse()
+                .then(first.kills.cmp(&second.kills).reverse()),
         },
     );
 
-    scoreboard_entries.iter().for_each(
-        |ScoreboardEntry(player_name, team, (kills, deaths, teamkills))| {
-            println!(
-                "{:24} | {:6} | K:{:<2} | D:{:<2} | TK:{:<2}",
-                player_name, team, kills, deaths, teamkills
-            );
-        },
+    let header_row = format!(
+        "{:<6} | {:30} | {:10} | {:<6} | {:<5} | {:<5}",
+        "Id", "Name", "Team", "Points", "Kills", "Deaths"
     );
+
+    println!("{}", header_row);
+    println!("{}", "-".repeat(header_row.len()));
+
+    scoreboard_entries.iter().for_each(|(player_id, entry)| {
+        println!(
+            "{:<6} | {:30} | {:10} | {:<6} | {:<5} | {:<5}",
+            player_id,
+            entry.name,
+            match entry.team {
+                Team::ALLIES => "Allies",
+                Team::AXIS => "Axis",
+                Team::SPECTATORS => "Spectators",
+                Team::UNKNOWN => "Unknown",
+            },
+            entry.points,
+            entry.kills,
+            entry.deaths
+        )
+    });
 }
