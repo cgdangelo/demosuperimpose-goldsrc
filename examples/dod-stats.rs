@@ -6,11 +6,12 @@ use std::convert::identity;
 use std::env::args;
 use std::fs::File;
 use std::io::Read;
+use std::process::exit;
 use std::str::from_utf8;
 
-use nom::IResult;
-use nom::number::complete::{be_u16, le_u8};
+use nom::number::complete::{le_u16, le_u8};
 use nom::sequence::tuple;
+use nom::IResult;
 
 use demosuperimpose_goldsrc::netmsg_doer::parse_netmsg;
 use demosuperimpose_goldsrc::netmsg_doer::utils::get_initial_delta;
@@ -26,7 +27,7 @@ struct Frags {
 #[derive(Debug)]
 struct ScoreShort {
     player_idx: u8,
-    points: u8,
+    points: u16,
     kills: u16,
     deaths: u16,
 }
@@ -41,7 +42,13 @@ struct ScoreInfo {
     team: u8,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
+struct TeamScore {
+    team_id: u8,
+    value: u16,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum Team {
     ALLIES,
     AXIS,
@@ -124,7 +131,7 @@ fn parse_frags(i: &[u8]) -> IResult<&[u8], Frags> {
 }
 
 fn parse_score_short(i: &[u8]) -> IResult<&[u8], ScoreShort> {
-    let (i, (player_idx, points, kills, deaths)) = tuple((le_u8, le_u8, be_u16, be_u16))(i)?;
+    let (i, (player_idx, points, kills, deaths)) = tuple((le_u8, le_u16, le_u16, le_u16))(i)?;
 
     Ok((
         i,
@@ -137,12 +144,21 @@ fn parse_score_short(i: &[u8]) -> IResult<&[u8], ScoreShort> {
     ))
 }
 
+fn parse_team_score(i: &[u8]) -> IResult<&[u8], TeamScore> {
+    let (i, (team_id, value)) = tuple((le_u8, le_u16))(i)?;
+
+    Ok((i, TeamScore { team_id, value }))
+}
+
 fn main() {
     let args: Vec<String> = args().collect();
 
     let demo_path = match args.len() {
         2 => args.get(1).unwrap(),
-        _ => panic!("Need a demo path. Re-run with: ./dod-stats ./path/to/demo.dem"),
+        _ => {
+            println!("Need a demo path. Re-run with: ./dod-stats ./path/to/demo.dem");
+            exit(1);
+        }
     };
 
     let demo = open_demo!(demo_path);
@@ -173,6 +189,8 @@ fn main() {
 
     // Mapping of player id to aggregated metrics.
     let mut scoreboard: HashMap<u32, ScoreboardEntry> = HashMap::new();
+
+    let mut team_scores: HashMap<Team, u16> = HashMap::new();
 
     network_messages.for_each(|message| match message {
         Message::EngineMessage(EngineMessage::SvcUpdateUserInfo(update_user_info)) => {
@@ -250,13 +268,13 @@ fn main() {
                             scoreboard
                                 .entry(*player_id)
                                 .and_modify(|entry| {
-                                    entry.points = score_short.points;
+                                    entry.points = score_short.points as u8;
                                     entry.kills = score_short.kills as u8;
                                     entry.deaths = score_short.deaths as u8;
                                 })
                                 .or_insert(ScoreboardEntry {
                                     name: format!("Player {}", player_id),
-                                    points: score_short.points,
+                                    points: score_short.points as u8,
                                     kills: score_short.kills as u8,
                                     deaths: score_short.deaths as u8,
                                     team: Team::UNKNOWN,
@@ -264,17 +282,24 @@ fn main() {
                         }
                     }
                 }
+
+                Ok("TeamScore") => {
+                    if let Ok((_, team_score)) = parse_team_score(user_msg.data) {
+                        team_scores.insert(Team::from(team_score.team_id), team_score.value);
+                    }
+                }
+
                 _ => {}
             }
         }
         _ => {}
     });
 
-    let mut scoreboard_entries = scoreboard
+    let mut scoreboard_rows = scoreboard
         .into_iter()
         .collect::<Vec<(u32, ScoreboardEntry)>>();
 
-    scoreboard_entries.sort_by(
+    scoreboard_rows.sort_by(
         |(_, first), (_, second)| match (&first.team, &second.team) {
             (Team::ALLIES, Team::AXIS) => Ordering::Less,
             (Team::AXIS, Team::ALLIES) => Ordering::Greater,
@@ -293,10 +318,13 @@ fn main() {
         "Id", "Name", "Team", "Points", "Kills", "Deaths"
     );
 
+    println!("Team scores: {:?}", team_scores);
+    println!();
+
     println!("{}", header_row);
     println!("{}", "-".repeat(header_row.len()));
 
-    scoreboard_entries.iter().for_each(|(player_id, entry)| {
+    scoreboard_rows.iter().for_each(|(player_id, entry)| {
         println!(
             "{:<6} | {:30} | {:10} | {:<6} | {:<5} | {:<5}",
             player_id,
